@@ -1,3 +1,5 @@
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
@@ -46,7 +48,7 @@ module Cardano.Api.Block (
 
 import           Prelude
 
-import           Data.Aeson (ToJSON (..), object, (.=))
+import           Data.Aeson (FromJSON (..), ToJSON (..), object, (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Short as SBS
@@ -69,15 +71,16 @@ import qualified Ouroboros.Network.Block as Consensus
 
 import qualified Cardano.Chain.Block as Byron
 import qualified Cardano.Chain.UTxO as Byron
+import qualified Cardano.Ledger.Block as Ledger
 import qualified Cardano.Ledger.Era as Ledger
 import qualified Cardano.Protocol.TPraos.BHeader as TPraos
-import qualified Cardano.Ledger.Block as Ledger
 
 import           Cardano.Api.Eras
 import           Cardano.Api.HasTypeProxy
 import           Cardano.Api.Hash
 import           Cardano.Api.Modes
 import           Cardano.Api.SerialiseRaw
+import           Cardano.Api.SerialiseUsing
 import           Cardano.Api.Tx
 
 {- HLINT ignore "Use lambda" -}
@@ -237,6 +240,9 @@ data BlockHeader = BlockHeader !SlotNo
 -- representation.
 newtype instance Hash BlockHeader = HeaderHash SBS.ShortByteString
   deriving (Eq, Ord, Show)
+  deriving (ToJSON, FromJSON) via UsingRawBytesHex (Hash BlockHeader)
+
+
 
 instance SerialiseAsRawBytes (Hash BlockHeader) where
     serialiseToRawBytes (HeaderHash bs) = SBS.fromShort bs
