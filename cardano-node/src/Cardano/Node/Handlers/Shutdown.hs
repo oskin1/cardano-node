@@ -36,7 +36,7 @@ import           Cardano.Slotting.Slot (WithOrigin (..))
 import           Control.Tracer
 import qualified Ouroboros.Consensus.Storage.ChainDB as ChainDB
 import           Ouroboros.Consensus.Util.ResourceRegistry (ResourceRegistry)
-import           Ouroboros.Consensus.Util.STM (Watcher(..), forkLinkedWatcher)
+import           Ouroboros.Consensus.Util.STM (Watcher (..), forkLinkedWatcher)
 import           Ouroboros.Network.Block (MaxSlotNo (..), SlotNo, pointSlot)
 
 import           Cardano.Node.Configuration.POM (NodeConfiguration (..))
@@ -54,12 +54,13 @@ import           Cardano.Node.Configuration.POM (NodeConfiguration (..))
 --   - by parent process
 -- ..or automatically, because the parent process itself terminated,
 -- then we initiate a clean shutdown.
+-- TODO: Rename to ShutdownIPC
 data ShutdownFDs
   = NoShutdownFDs
   | ExternalShutdown !ShutdownListener
-  -- ^ Shutdown to be provided by external process.
-  | InternalShutdown !ShutdownListener !ShutdownDoorbell
-  -- ^ Shutdown to be provided from within the process.
+ -- -- ^ Shutdown to be provided by external process.
+ -- | InternalShutdown !ShutdownListener !ShutdownDoorbell
+ -- -- ^ Shutdown to be provided from within the process.
 
 -- | FD used to send an EOF-based request for shutdown.
 newtype ShutdownDoorbell = ShutdownDoorbell { _doorbellFd :: Fd }
@@ -127,59 +128,64 @@ triggerShutdown (ShutdownDoorbell (Fd shutFd)) trace reason = do
 
 -- | We provide an optional cross-platform method to politely request shut down.
 --
--- For the duration of 'action', we gracefully handle shutdown requests,
--- external or internal, as requested by configuration in 'NodeCLI',
--- while allocating corresponding 'ShutdownFDs', and providing them to the 'action'.
+-- For the duration of 'action', we gracefully handle shutdown requests
+-- provided if listening for such is configured in the 'NodeConfiguration'
 withShutdownHandling
   :: NodeConfiguration
   -> Trace IO Text
-  -> (ShutdownFDs -> IO ())
+  -> IO ()
+  -- ^ Action to potentially shutdown via file descriptor
   -> IO ()
 withShutdownHandling nc trace action = do
-  sfds <- decideShutdownFds nc
-  withShutdownHandler (sfdsListener sfds) trace (action sfds)
+  case listenForShutdownRequest nc of
+    NoShutdownFDs -> action
+    ExternalShutdown (ShutdownListener fileDescriptor) -> do
+      Async.race_ (waitForEOF fileDescriptor) action
  where
-   decideShutdownFds :: NodeConfiguration -> IO ShutdownFDs
-   decideShutdownFds NodeConfiguration{ncShutdownIPC = Just fd} =
-     pure $ ExternalShutdown (ShutdownListener fd)
-   decideShutdownFds NodeConfiguration{ncShutdownOnSlotSynced = MaxSlotNo{}} =
-     mkInternalShutdown
-   decideShutdownFds _ = pure NoShutdownFDs
+   listenForShutdownRequest :: NodeConfiguration -> ShutdownFDs
+   listenForShutdownRequest NodeConfiguration{ncShutdownIPC = Just fd} =
+    ExternalShutdown (ShutdownListener fd)
+   listenForShutdownRequest _ = NoShutdownFDs
 
-   mkInternalShutdown :: IO ShutdownFDs
-   mkInternalShutdown = do
-     (r, w) <- IO.createPipeFd
-     pure $ InternalShutdown (ShutdownListener $ Fd r) (ShutdownDoorbell $ Fd w)
+   waitForEOF :: Fd -> IO ()
+   waitForEOF (Fd fd) = do
+     hnd <- IO.fdToHandle fd
+     r   <- try $ IO.hGetChar hnd
+     case r of
+       Left e
+         | IO.isEOFError e -> traceWith tracer "received shutdown request and shutting node down..."
+         | otherwise -> do
+             traceWith tracer "received shutdown request but did not encounter EOL in --shutdown-ipc FD"
+             throwIO e
+       Right _  -> do
+         traceWith tracer "received shutdown request but did found unexpected input in --shutdown-ipc FD"
+         throwIO $ IO.userError "--shutdown-ipc FD does not expect input"
 
--- | If configuration in 'NodeCLI' and 'ShutdownFDs' agree,
--- spawn a thread that would cause node to shutdown upon ChainDB reaching the
+-- | Spawn a thread that would cause node to shutdown upon ChainDB reaching the
 -- configuration-defined slot.
 maybeSpawnOnSlotSyncedShutdownHandler
   :: NodeConfiguration
-  -> ShutdownFDs
   -> Trace IO Text
   -> ResourceRegistry IO
   -> ChainDB.ChainDB IO blk
   -> IO ()
-maybeSpawnOnSlotSyncedShutdownHandler nc sfds trace registry chaindb =
-  case (ncShutdownOnSlotSynced nc, sfds) of
-    (MaxSlotNo maxSlot, InternalShutdown _sl sd) -> do
+maybeSpawnOnSlotSyncedShutdownHandler nc trace registry chaindb =
+  case ncShutdownOnSlotSynced nc of
+    MaxSlotNo maxSlot -> do
       traceWith (trTransformer MaximalVerbosity $ severityNotice trace)
         ("will terminate upon reaching " <> pack (show maxSlot))
-      spawnSlotLimitTerminator maxSlot sd
-    (MaxSlotNo{}, _) -> panic
-      "internal error: slot-limited shutdown requested, but no proper ShutdownFDs passed."
-    _ -> pure ()
+      spawnSlotLimitTerminator maxSlot
  where
-  spawnSlotLimitTerminator :: SlotNo -> ShutdownDoorbell -> IO ()
-  spawnSlotLimitTerminator maxSlot sd =
+  spawnSlotLimitTerminator :: SlotNo -> IO ()
+  spawnSlotLimitTerminator maxSlot =
     void $ forkLinkedWatcher registry "slotLimitTerminator" Watcher {
         wFingerprint = identity
       , wInitial     = Nothing
       , wNotify      = \case
           Origin -> pure ()
-          At cur -> when (cur >= maxSlot) $
-            triggerShutdown sd trace
-            ("spawnSlotLimitTerminator: reached target " <> show cur)
+          At cur -> when (cur >= maxSlot) $ do
+            traceWith (trTransformer MaximalVerbosity $ severityNotice trace)
+              ("spawnSlotLimitTerminator: reached target " <> show cur)
+            throwIO undefined
       , wReader      = pointSlot <$> ChainDB.getTipPoint chaindb
       }
